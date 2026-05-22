@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fractal Planets — Infinite Zoom</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{overflow:hidden;background:#000;font-family:'Segoe UI',sans-serif;cursor:crosshair}
+        canvas{display:block}
+        #ui{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);z-index:10;text-align:center;pointer-events:none}
+        #depth{color:rgba(0,255,255,.7);font-size:.75rem;letter-spacing:4px;text-transform:uppercase;text-shadow:0 0 15px rgba(0,255,255,.3)}
+        #hint{color:rgba(255,255,255,.35);font-size:.65rem;letter-spacing:2px;margin-top:8px}
+        #title{position:fixed;top:30px;left:50%;transform:translateX(-50%);z-index:10;color:rgba(0,255,255,.5);font-size:.8rem;letter-spacing:6px;text-transform:uppercase;pointer-events:none;text-shadow:0 0 20px rgba(0,255,255,.2)}
+        .bloom{position:fixed;inset:0;pointer-events:none;z-index:5;background:radial-gradient(circle,rgba(0,150,255,.04) 0%,transparent 70%);mix-blend-mode:screen;animation:bp 5s ease-in-out infinite}
+        @keyframes bp{0%,100%{opacity:.4}50%{opacity:1}}
+        .vignette{position:fixed;inset:0;pointer-events:none;z-index:4;background:radial-gradient(ellipse at center,transparent 50%,rgba(0,0,0,.6) 100%)}
+        #hand-video{display:none}
+        #gesture{position:fixed;top:70px;left:50%;transform:translateX(-50%);z-index:10;color:rgba(0,255,255,.5);font-size:.7rem;letter-spacing:3px;pointer-events:none;text-shadow:0 0 10px rgba(0,255,255,.2)}
+    </style>
+</head>
+<body>
+    <div class="bloom"></div>
+    <div class="vignette"></div>
+    <div id="title">✦ Paul's Univers✦</div>
+    <div id="ui">
+        <div id="depth">DEPTH: 0 — UNIVERSE</div>
+        <div id="hint">CLICK OR OPEN PALM TO DIVE · FIST TO GO BACK · PINCH TO ZOOM</div>
+    </div>
+    <div id="gesture">✋ AWAITING HAND...</div>
+    <video id="hand-video" playsinline></video>
+
+    <script>
+    const depthNames = ['UNIVERSE','GALAXY','SOLAR SYSTEM','PLANET','MOON','ATOM','QUARK','STRING','∞'];
+    const palettes = [
+        {core:[0,.6,1],ring:[0,.9,1],bg:[.02,.02,.08]},
+        {core:[.8,.2,1],ring:[1,.3,.8],bg:[.05,.01,.06]},
+        {core:[1,.5,.1],ring:[1,.8,.2],bg:[.06,.03,.01]},
+        {core:[.1,1,.5],ring:[.2,1,.8],bg:[.01,.05,.03]},
+        {core:[1,.2,.2],ring:[1,.5,.3],bg:[.06,.01,.01]},
+        {core:[.3,.5,1],ring:[.5,.7,1],bg:[.01,.02,.06]},
+        {core:[1,.9,.2],ring:[1,1,.5],bg:[.06,.05,.01]},
+        {core:[.5,1,1],ring:[.7,1,.9],bg:[.02,.05,.05]},
+    ];
+
+    let scene, camera, renderer, raycaster, mouse;
+    let currentSystem = null;
+    let depthLevel = 0;
+    let systemStack = [];
+    let time = 0;
+    let targetCamZ = 20;
+    let transitioning = false;
+    let handGroup3D, handSkeleton3D, handPoints3D;
+    let gestureState = 'none';
+    let gestureCooldown = 0;
+    let lastPinchDist = 0;
+
+    function createPlanetSystem(depth, parentPos) {
+        const pal = palettes[depth % palettes.length];
+        const group = new THREE.Group();
+        if (parentPos) group.position.copy(parentPos);
+
+        // Core planet — sphere of particles
+        const coreCount = 8000 + depth * 2000;
+        const coreGeo = new THREE.BufferGeometry();
+        const cPos = new Float32Array(coreCount * 3);
+        const cCol = new Float32Array(coreCount * 3);
+        const cSizes = new Float32Array(coreCount);
+        const radius = 3;
+
+        for (let i = 0; i < coreCount; i++) {
+            const theta = Math.acos(2 * Math.random() - 1);
+            const phi = Math.random() * Math.PI * 2;
+            const r = radius * (0.85 + Math.random() * 0.15);
+            cPos[i*3] = r * Math.sin(theta) * Math.cos(phi);
+            cPos[i*3+1] = r * Math.sin(theta) * Math.sin(phi);
+            cPos[i*3+2] = r * Math.cos(theta);
+
+            const variation = Math.random() * 0.3;
+            cCol[i*3] = pal.core[0] + variation * 0.2;
+            cCol[i*3+1] = pal.core[1] + variation * 0.3;
+            cCol[i*3+2] = pal.core[2] + variation * 0.2;
+            cSizes[i] = 0.03 + Math.random() * 0.04;
+        }
+        coreGeo.setAttribute('position', new THREE.BufferAttribute(cPos, 3));
+        coreGeo.setAttribute('color', new THREE.BufferAttribute(cCol, 3));
+
+        const coreMat = new THREE.PointsMaterial({
+            size: 0.05, vertexColors: true, transparent: true,
+            opacity: 0.9, blending: THREE.AdditiveBlending
+        });
+        const core = new THREE.Points(coreGeo, coreMat);
+        core.userData = { type: 'core', depth: depth };
+        group.add(core);
+
+        // Inner glow sphere
+        const glowGeo = new THREE.SphereGeometry(radius * 0.6, 32, 32);
+        const glowMat = new THREE.MeshBasicMaterial({
+            color: new THREE.Color(pal.core[0], pal.core[1], pal.core[2]),
+            transparent: true, opacity: 0.08, blending: THREE.AdditiveBlending
+        });
+        group.add(new THREE.Mesh(glowGeo, glowMat));
+
+        // Rings
+        const ringCount = 10000;
+        const ringGeo = new THREE.BufferGeometry();
+        const rPos = new Float32Array(ringCount * 3);
+        const rCol = new Float32Array(ringCount * 3);
+        for (let i = 0; i < ringCount; i++) {
+            const r = 5 + Math.random() * 3;
+            const a = Math.random() * Math.PI * 2;
+            rPos[i*3] = Math.cos(a) * r;
+            rPos[i*3+1] = (Math.random() - 0.5) * 0.15;
+            rPos[i*3+2] = Math.sin(a) * r;
+
+            const t = a / (Math.PI * 2);
+            rCol[i*3] = pal.ring[0] * (0.5 + t * 0.5);
+            rCol[i*3+1] = pal.ring[1] * (0.3 + t * 0.7);
+            rCol[i*3+2] = pal.ring[2] * (0.6 + (1-t) * 0.4);
+        }
+        ringGeo.setAttribute('position', new THREE.BufferAttribute(rPos, 3));
+        ringGeo.setAttribute('color', new THREE.BufferAttribute(rCol, 3));
+        const ringMat = new THREE.PointsMaterial({
+            size: 0.03, vertexColors: true, transparent: true,
+            opacity: 0.6, blending: THREE.AdditiveBlending
+        });
+        const rings = new THREE.Points(ringGeo, ringMat);
+        rings.rotation.x = Math.PI / 3 + (depth * 0.2);
+        group.add(rings);
+
+        // Mini orbiting planets (clickable!)
+        const miniCount = 5 + Math.floor(Math.random() * 4);
+        for (let m = 0; m < miniCount; m++) {
+            const orbitR = 6 + m * 1.8 + Math.random();
+            const angle = Math.random() * Math.PI * 2;
+            const miniGroup = new THREE.Group();
+
+            // Mini planet sphere particles
+            const mCount = 800;
+            const mGeo = new THREE.BufferGeometry();
+            const mPos = new Float32Array(mCount * 3);
+            const mCol = new Float32Array(mCount * 3);
+            const mRadius = 0.3 + Math.random() * 0.4;
+
+            const mPal = palettes[(depth + m + 1) % palettes.length];
+            for (let i = 0; i < mCount; i++) {
+                const t = Math.acos(2 * Math.random() - 1);
+                const p = Math.random() * Math.PI * 2;
+                mPos[i*3] = mRadius * Math.sin(t) * Math.cos(p);
+                mPos[i*3+1] = mRadius * Math.sin(t) * Math.sin(p);
+                mPos[i*3+2] = mRadius * Math.cos(t);
+                mCol[i*3] = mPal.core[0] + Math.random() * 0.2;
+                mCol[i*3+1] = mPal.core[1] + Math.random() * 0.2;
+                mCol[i*3+2] = mPal.core[2] + Math.random() * 0.2;
+            }
+            mGeo.setAttribute('position', new THREE.BufferAttribute(mPos, 3));
+            mGeo.setAttribute('color', new THREE.BufferAttribute(mCol, 3));
+
+            const mini = new THREE.Points(mGeo, new THREE.PointsMaterial({
+                size: 0.04, vertexColors: true, transparent: true,
+                opacity: 0.85, blending: THREE.AdditiveBlending
+            }));
+            mini.userData = { type: 'mini', depth: depth, orbitR, orbitAngle: angle, orbitSpeed: 0.1 + Math.random() * 0.3, mRadius };
+
+            // Orbit ring line
+            const orbitGeo = new THREE.BufferGeometry();
+            const orbitPts = [];
+            for (let i = 0; i <= 128; i++) {
+                const a = (i / 128) * Math.PI * 2;
+                orbitPts.push(Math.cos(a) * orbitR, 0, Math.sin(a) * orbitR);
+            }
+            orbitGeo.setAttribute('position', new THREE.Float32BufferAttribute(orbitPts, 3));
+            const orbitLine = new THREE.Line(orbitGeo, new THREE.LineBasicMaterial({
+                color: new THREE.Color(mPal.ring[0]*.3, mPal.ring[1]*.3, mPal.ring[2]*.3),
+                transparent: true, opacity: 0.15
+            }));
+            orbitLine.rotation.x = Math.PI / 3 + (depth * 0.2);
+            group.add(orbitLine);
+
+            miniGroup.add(mini);
+            miniGroup.position.set(Math.cos(angle) * orbitR, 0, Math.sin(angle) * orbitR);
+            group.add(miniGroup);
+        }
+
+        // Store refs
+        group.userData = { core, rings, depth, pal };
+        return group;
+    }
+
+    function init() {
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.01, 2000);
+        camera.position.z = 20;
+
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(innerWidth, innerHeight);
+        renderer.setPixelRatio(devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        raycaster = new THREE.Raycaster();
+        raycaster.params.Points.threshold = 0.5;
+        mouse = new THREE.Vector2();
+
+        // Stars
+        const starGeo = new THREE.BufferGeometry();
+        const sp = new Float32Array(8000 * 3), sc = new Float32Array(8000 * 3);
+        for (let i = 0; i < 8000; i++) {
+            sp[i*3] = (Math.random()-.5)*1500; sp[i*3+1] = (Math.random()-.5)*1500; sp[i*3+2] = (Math.random()-.5)*1500;
+            const b = .5 + Math.random()*.5;
+            sc[i*3] = b; sc[i*3+1] = b * (.8+Math.random()*.2); sc[i*3+2] = b;
+        }
+        starGeo.setAttribute('position', new THREE.BufferAttribute(sp, 3));
+        starGeo.setAttribute('color', new THREE.BufferAttribute(sc, 3));
+        scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({size: .4, vertexColors: true, transparent: true, opacity: .7, blending: THREE.AdditiveBlending})));
+
+        // Initial system
+        currentSystem = createPlanetSystem(0);
+        scene.add(currentSystem);
+
+        // Events
+        addEventListener('resize', () => {
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(innerWidth, innerHeight);
+        });
+
+        addEventListener('wheel', e => {
+            targetCamZ = Math.max(5, Math.min(60, targetCamZ + e.deltaY * 0.02));
+        });
+
+        addEventListener('click', onClickDive);
+        addEventListener('contextmenu', e => { e.preventDefault(); onZoomOut(); });
+
+        // 3D hand skeleton
+        handGroup3D = new THREE.Group();
+        const skGeo = new THREE.BufferGeometry();
+        handSkeleton3D = new THREE.LineSegments(skGeo, new THREE.LineBasicMaterial({color:0x00ccff,transparent:true,opacity:.7}));
+        const hpGeo = new THREE.BufferGeometry();
+        handPoints3D = new THREE.Points(hpGeo, new THREE.PointsMaterial({color:0x00ffff,size:.12,transparent:true,blending:THREE.AdditiveBlending}));
+        handGroup3D.add(handSkeleton3D);
+        handGroup3D.add(handPoints3D);
+        handGroup3D.position.set(0,0,-10);
+        handGroup3D.visible = false;
+        camera.add(handGroup3D);
+        scene.add(camera);
+
+        // Start hand tracking
+        startHandTracking();
+
+        animate();
+    }
+
+    const handConns = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]];
+
+    function isHandFist(lm) {
+        const tips=[8,12,16,20], joints=[6,10,14,18];
+        let closed=0;
+        for(let i=0;i<4;i++) if(lm[tips[i]].y > lm[joints[i]].y) closed++;
+        return closed >= 3;
+    }
+
+    function isHandOpen(lm) {
+        const tips=[8,12,16,20], joints=[6,10,14,18];
+        let open=0;
+        for(let i=0;i<4;i++) if(lm[tips[i]].y < lm[joints[i]].y) open++;
+        return open >= 4;
+    }
+
+    function getPinchDist(lm) {
+        return Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
+    }
+
+    async function startHandTracking() {
+        const video = document.getElementById('hand-video');
+        const hands = new Hands({locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+        hands.setOptions({maxNumHands:1, modelComplexity:1, minDetectionConfidence:.7, minTrackingConfidence:.7});
+
+        hands.onResults(results => {
+            if(gestureCooldown > 0) gestureCooldown -= 0.016;
+            const gEl = document.getElementById('gesture');
+
+            if(results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const lm = results.multiHandLandmarks[0];
+                handGroup3D.visible = true;
+
+                // Update 3D hand skeleton
+                const positions = [], linePositions = [];
+                lm.forEach(l => {
+                    positions.push(((1-l.x)-.5)*15, -(l.y-.5)*10, 0);
+                });
+                handConns.forEach(([s,e]) => {
+                    linePositions.push(positions[s*3],positions[s*3+1],positions[s*3+2]);
+                    linePositions.push(positions[e*3],positions[e*3+1],positions[e*3+2]);
+                });
+                handPoints3D.geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+                handSkeleton3D.geometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions,3));
+
+                // Pinch zoom
+                const pinch = getPinchDist(lm);
+                if(lastPinchDist > 0) {
+                    const delta = (pinch - lastPinchDist) * 80;
+                    targetCamZ = Math.max(5, Math.min(60, targetCamZ - delta));
+                }
+                lastPinchDist = pinch;
+
+                // Gesture detection
+                const fist = isHandFist(lm);
+                const open = isHandOpen(lm);
+
+                if(open && gestureCooldown <= 0) {
+                    gEl.textContent = '✋ PALM OPEN — DIVING IN';
+                    // Simulate click at center to dive in
+                    if(!transitioning) {
+                        mouse.x = ((1-lm[9].x) - 0.5) * 2;
+                        mouse.y = -(lm[9].y - 0.5) * 2;
+                        raycaster.setFromCamera(mouse, camera);
+                        const hits = raycaster.intersectObjects(currentSystem.children, true);
+                        if(hits.length > 0) {
+                            gestureCooldown = 2;
+                            diveInto(hits[0].point);
+                        }
+                    }
+                } else if(fist && gestureCooldown <= 0) {
+                    gEl.textContent = '✊ FIST — ZOOMING OUT';
+                    gestureCooldown = 2;
+                    onZoomOut();
+                } else if(gestureCooldown <= 0) {
+                    gEl.textContent = '👌 PINCH TO ZOOM';
+                }
+            } else {
+                handGroup3D.visible = false;
+                lastPinchDist = 0;
+                gEl.textContent = '✋ AWAITING HAND...';
+            }
+        });
+
+        if(typeof Camera !== 'undefined') {
+            new Camera(video, {onFrame: async()=>{await hands.send({image:video})}, width:640, height:480}).start();
+        } else {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});
+                video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    video.play();
+                    const pf = async()=>{ await hands.send({image:video}); requestAnimationFrame(pf); };
+                    pf();
+                };
+            } catch(e) { console.log('No camera'); }
+        }
+    }
+
+    function diveInto(hitPoint) {
+        if(transitioning) return;
+        transitioning = true;
+        systemStack.push({ system: currentSystem, camZ: camera.position.z, depth: depthLevel });
+        depthLevel++;
+        const newSystem = createPlanetSystem(depthLevel, hitPoint);
+        newSystem.scale.set(0.01, 0.01, 0.01);
+        scene.add(newSystem);
+        const startZ = camera.position.z;
+        const oldSystem = currentSystem;
+        let progress = 0;
+        function transAnim() {
+            progress += 0.02;
+            const t = Math.min(1, progress);
+            const ease = t < .5 ? 2*t*t : -1+(4-2*t)*t;
+            camera.position.x = THREE.MathUtils.lerp(0, hitPoint.x, ease * 0.3);
+            camera.position.y = THREE.MathUtils.lerp(0, hitPoint.y, ease * 0.3);
+            camera.position.z = THREE.MathUtils.lerp(startZ, 20, ease);
+            camera.lookAt(THREE.MathUtils.lerp(0, hitPoint.x, ease), THREE.MathUtils.lerp(0, hitPoint.y, ease), 0);
+            const s = 0.01 + ease * 0.99;
+            newSystem.scale.set(s, s, s);
+            oldSystem.children.forEach(c => { if (c.material) c.material.opacity = 1 - ease; });
+            if (t < 1) { requestAnimationFrame(transAnim); }
+            else {
+                scene.remove(oldSystem);
+                currentSystem = newSystem;
+                newSystem.position.set(0,0,0);
+                camera.position.set(0,0,20);
+                camera.lookAt(0,0,0);
+                targetCamZ = 20;
+                transitioning = false;
+                updateUI();
+            }
+        }
+        transAnim();
+        updateUI();
+    }
+
+    function onClickDive(e) {
+        if (transitioning) return;
+        mouse.x = (e.clientX / innerWidth) * 2 - 1;
+        mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+        raycaster.setFromCamera(mouse, camera);
+        const hits = raycaster.intersectObjects(currentSystem.children, true);
+        if (hits.length > 0) diveInto(hits[0].point);
+    }
+
+    function onZoomOut() {
+        if (transitioning || systemStack.length === 0) return;
+        transitioning = true;
+
+        const prev = systemStack.pop();
+        depthLevel = prev.depth;
+
+        const oldSystem = currentSystem;
+        scene.add(prev.system);
+        prev.system.children.forEach(c => { if (c.material) c.material.opacity = 1; });
+
+        let progress = 0;
+        function outAnim() {
+            progress += 0.025;
+            const t = Math.min(1, progress);
+            const ease = t < .5 ? 2*t*t : -1+(4-2*t)*t;
+
+            const s = 1 - ease * 0.99;
+            oldSystem.scale.set(s, s, s);
+            camera.position.z = THREE.MathUtils.lerp(camera.position.z, prev.camZ, 0.05);
+
+            if (t < 1) {
+                requestAnimationFrame(outAnim);
+            } else {
+                scene.remove(oldSystem);
+                currentSystem = prev.system;
+                camera.position.set(0, 0, prev.camZ);
+                camera.lookAt(0, 0, 0);
+                targetCamZ = prev.camZ;
+                transitioning = false;
+                updateUI();
+            }
+        }
+        outAnim();
+        updateUI();
+    }
+
+    function updateUI() {
+        const name = depthNames[Math.min(depthLevel, depthNames.length - 1)];
+        document.getElementById('depth').textContent = `DEPTH: ${depthLevel} — ${name}`;
+        document.getElementById('depth').style.color = depthLevel > 3
+            ? `rgba(255,${150-depthLevel*15},${100+depthLevel*10},.8)`
+            : 'rgba(0,255,255,.7)';
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        time += 0.016;
+
+        // Smooth camera zoom
+        camera.position.z += (targetCamZ - camera.position.z) * 0.08;
+
+        if (currentSystem && !transitioning) {
+            const data = currentSystem.userData;
+
+            // Rotate core planet
+            if (data.core) data.core.rotation.y += 0.003;
+            if (data.rings) data.rings.rotation.z += 0.002;
+
+            // Animate color shift on core
+            if (data.core) {
+                const colors = data.core.geometry.attributes.color;
+                const pal = data.pal;
+                for (let i = 0; i < colors.count; i++) {
+                    const phase = time * 0.3 + i * 0.0005;
+                    colors.array[i*3] = pal.core[0] + Math.sin(phase) * 0.15;
+                    colors.array[i*3+1] = pal.core[1] + Math.sin(phase + 2) * 0.15;
+                    colors.array[i*3+2] = pal.core[2] + Math.sin(phase + 4) * 0.1;
+                }
+                colors.needsUpdate = true;
+            }
+
+            // Orbit mini planets
+            currentSystem.children.forEach(child => {
+                if (child.children) {
+                    child.children.forEach(sub => {
+                        if (sub.userData && sub.userData.type === 'mini') {
+                            const d = sub.userData;
+                            d.orbitAngle += d.orbitSpeed * 0.016;
+                            child.position.x = Math.cos(d.orbitAngle) * d.orbitR;
+                            child.position.z = Math.sin(d.orbitAngle) * d.orbitR;
+                            sub.rotation.y += 0.02;
+                        }
+                    });
+                }
+            });
+        }
+
+        renderer.render(scene, camera);
+    }
+
+    window.onload = init;
+    </script>
+</body>
+</html>
